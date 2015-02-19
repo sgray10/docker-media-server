@@ -1,0 +1,204 @@
+#!/bin/bash
+HOST_IP=`ifconfig en0 | awk '/inet /{print substr($2,0)}'`
+SERVER_DIR="/Volumes/My\ Passport\ for\ Mac/data/media/server"
+SERVER_DIR2="/Volumes/media2/data/media/server"
+APPDATA="/mnt/server/data"
+APPDATA2="/mnt/server2/data"
+CONFIGS="/mnt/server/config"
+
+function logger() {
+  echo "[server]: $1"
+}
+
+function die() {
+  logger "ERROR: $1"
+  echo "Exiting with non-zero status." && exit 1
+}
+
+function is_vm_up() {
+  boot2docker status | grep -q "running" 2> /dev/null
+  return "$?"
+}
+
+function vm_up() {
+  logger "starting virtual machine" && boot2docker up &> /dev/null 
+  is_vm_up && logger "vm started" || die "couldn't start vm" 
+  $(boot2docker shellinit &>/dev/null)
+  [ "$?" -eq 0 ] && logger "environment initialized" || die "shellinit failed"
+}
+
+function is_mounted() {
+  boot2docker ssh "mount | grep /mnt/server >/dev/null" 2> /dev/null && \
+  boot2docker ssh "mount | grep /mnt/server2 >/dev/null" 2> /dev/null
+  return "$?"
+}
+
+function mount_nfs() {
+  logger "mounting $HOST_IP:$SERVER_DIR at /mnt/server"
+  logger "mounting $HOST_IP:$SERVER_DIR2 at /mnt/server2"
+  boot2docker ssh "sudo mkdir -p /mnt/server /mnt/server2"
+  boot2docker ssh "sudo /usr/local/etc/init.d/nfs-client restart >/dev/null"
+  boot2docker ssh "sudo mount $HOST_IP:$SERVER_DIR /mnt/server"
+  boot2docker ssh "sudo mount $HOST_IP:$SERVER_DIR2 /mnt/server2"
+  is_mounted || die "failed to mount $HOST_IP:$SERVER_DIR at /mnt/server"
+}
+
+function unmount_nfs() {
+  logger "unmounting $HOST_IP:$SERVER_DIR at /mnt/server"
+  logger "unmounting $HOST_IP:$SERVER_DIR2 at /mnt/server2"
+  boot2docker ssh "sudo umount /mnt/server" && \
+  boot2docker ssh "sudo umount /mnt/server2"
+  ! is_mounted || die "failed to unmounted $HOST_IP:$SERVER_DIR at /mnt/server"
+}
+
+function start_container() {
+  local cmd="docker run --name $1 -d $6-h $4 $2 $3 $5"
+  echo "$cmd"
+  local id=`$cmd`
+  if [ "$?" -eq 0 ]; then
+    logger "$id"
+  else 
+    die "failed to start container: $1"
+  fi
+}
+
+function start_proxy() {
+  local name="proxy"
+  local volumes="-v $CONFIGS/proxy:/etc/nginx"
+  local ports="-p 80:80"
+  local host="www.mediaserver.void"
+  local image="sgray10/proxy"
+  local opts=""
+  start_container "$name" "$volumes" "$ports" "$host" "$image" "$opts" 
+}
+
+function start_dns() {
+  local name="dns"
+  local volumes="-v /var/run/docker.sock:/var/run/docker.sock"
+  local ports="-p 53:53/udp -p 53:53"
+  local host="dns.void"
+  local image="sgray10/dns2"
+  local opts="-e DNS_DOMAIN=void "
+  start_container "$name" "$volumes" "$ports" "$host" "$image" "$opts" 
+}
+
+function start_plex() {
+  local name="plex"
+  local volumes="-v $CONFIGS/plex:/config -v $APPDATA/plex:/data -v $APPDATA2/plex:/data2"
+  local ports="-p 32400:32400 -p 32400:32400/udp -p 5353:5353/udp -p 1900:1900/udp -p 80:80"
+  local host="www.plex.void"
+  local image="sgray10/plex"
+  local opts=""
+  start_container "$name" "$volumes" "$ports" "$host" "$image" "$opts" 
+}
+
+function start_potato() {
+  local name="potato"
+  local volumes="-v $CONFIGS/potato:/config -v $APPDATA:/data -v $APPDATA2:/data2"
+  local ports="-p 5050:5050"
+  local host="www.potato.void"
+  local image="sgray10/potato"
+  local opts="--link deluged:deluged "
+  start_container "$name" "$volumes" "$ports" "$host" "$image" "$opts" 
+}
+
+function start_deluged() {
+  local name="deluged"
+  local volumes="-v $CONFIGS/deluge/deluged:/config -v $APPDATA:/data -v $APPDATA2:/data2"
+  local ports="-p 58846:58846"
+  local host="deluged.void"
+  local image="sgray10/deluged"
+  local opts=""
+  start_container "$name" "$volumes" "$ports" "$host" "$image" "$opts" 
+}
+
+function start_delugeui() {
+  local name="delugeui"
+  local volumes="-v $CONFIGS/deluge/webui:/config"
+  local ports="-p 8112:8112"
+  local host="www.delugeui.void"
+  local image="sgray10/delugeui"
+  local opts="--link deluged:deluged "
+  start_container "$name" "$volumes" "$ports" "$host" "$image" "$opts" 
+}
+
+function is_container_up() {
+  docker ps | grep "$1" | grep -q "Up"
+}
+
+function is_container_existent() {
+  docker ps -a | grep "$1" | grep -q "Exited"
+}
+
+function check_container() {
+  is_container_up "$1" && return 0
+  return 1
+}
+
+function is_running() {
+  check_container "dns" && \
+  check_container "plex" && \
+  check_container "potato" && \
+  check_container "deluged" && \
+  check_container "delugeui" || return 1
+  return 0
+}
+
+function is_server_up() {
+  is_mounted && is_running && return 0 || return 1
+}
+
+function stop_container() {
+  is_container_up "$1" && docker kill "$1" &>/dev/null
+  [ "$?" -eq 0 ] || logger "container not running: $1"
+  is_container_existent "$1" && docker rm "$1" &>/dev/null
+  [ "$?" -eq 0 ] && logger "stopped and/or removed container: $1" || logger "failed to remove container: $1"
+}
+
+function start_one() {
+  #is_vm_up || vm_up
+  #is_mounted || mount_nfs
+  start_"$1" || die "failed to start $1"
+}
+
+function stop_one() {
+  stop_container "$1" || die "failed to stop $1" 
+}
+
+function stop() {
+  stop_container "plex"
+  stop_container "potato"
+  stop_container "deluged"
+  stop_container "delugeui"
+  stop_container "dns"
+  is_mounted && unmount_nfs || logger "$HOST_IP:$SERVER_DIR not mounted"
+  ! is_server_up && logger "server stopped" || die "unable to stop server"
+  return 0
+}
+
+function start() {
+  #is_vm_up && logger "vm already running" || vm_up
+  #is_mounted && logger "$HOST_IP:$SERVER_DIR already mounted" || mount_nfs
+  #start_dns
+  #start_deluged 
+  #start_delugeui
+  #start_potato
+  start_plex
+  #is_server_up && logger "server started" || die "unable to start server"
+  return 0
+}
+
+function usage() {
+  echo "usage: $0 <start or stop> [plex deluged delugeui potato dns]" && exit 1
+}
+
+[[ "$#" -eq 1 || "$#" -eq 2 ]] && [[ "$1" = "start" || "$1" = "stop" ]] || usage
+[ "$#" -eq 1 ] && "$1" && exit 0
+
+if [ "$#" -eq 2 ]; then
+  if [[ "$2" = "dns" || "$2" = "plex" || "$2" = "deluged" || "$2" = delugeui || "$2" = "potato" ]]; then
+      "$1"_one "$2" && exit 0
+  else
+    usage
+  fi
+fi  

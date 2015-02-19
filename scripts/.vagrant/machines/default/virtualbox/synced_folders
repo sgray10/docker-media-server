@@ -1,0 +1,1 @@
+{"virtualbox":{"/vagrant":{"guestpath":"/vagrant","hostpath":"/Users/stephen/sgray/code/current/docker/media/scripts","disabled":false},"/archiso":{"guestpath":"/archiso","hostpath":"/Users/stephen/sgray/code/current/docker/media/scripts/archiso","disabled":false}}}
